@@ -1,5 +1,4 @@
 from __future__ import print_function, division
-
 from collections import defaultdict
 
 from sympy.core import (Basic, S, Add, Mul, Pow, Symbol, sympify,
@@ -32,7 +31,8 @@ from sympy.simplify.sqrtdenest import sqrtdenest
 from sympy.simplify.trigsimp import trigsimp, exptrigsimp
 from sympy.utilities.iterables import has_variety, sift
 
-
+import itertools
+import string
 import mpmath
 
 
@@ -765,7 +765,7 @@ def sum_combine(s_t):
                 for j, s_term2 in enumerate(s_t):
                     if not used[j] and i != j:
                         temp = sum_add(s_term1, s_term2, method)
-                        if isinstance(temp, Sum) or isinstance(temp, Mul):
+                        if isinstance(temp, Expr):
                             s_t[i] = temp
                             s_term1 = s_t[i]
                             used[j] = True
@@ -816,7 +816,7 @@ def sum_add(self, other, method=0):
         args = Mul.make_args(val)
         sumv = next(x for x in args if isinstance(x, Sum))
         constant = Mul(*[x for x in args if x != sumv])
-        return Sum(constant * sumv.function, *sumv.limits)
+        return Sum(constant * sumv.function, *sumv.limits)   
 
     if isinstance(self, Mul):
         rself = __refactor(self)
@@ -830,10 +830,13 @@ def sum_add(self, other, method=0):
 
     if type(rself) == type(rother):
         if method == 0:
+            # If the sums have identical limits, we simply add the sumands
             if rself.limits == rother.limits:
                 return factor_sum(Sum(rself.function + rother.function, *rself.limits))
         elif method == 1:
+            # If the sums have identival summands
             if simplify(rself.function - rother.function) == 0:
+                # And both are "Single Sums"
                 if len(rself.limits) == len(rother.limits) == 1:
                     i = rself.limits[0][0]
                     x1 = rself.limits[0][1]
@@ -847,9 +850,147 @@ def sum_add(self, other, method=0):
                             return factor_sum(Sum(rself.function, (i, x1, y2)))
                         elif x1 == y2 + 1:
                             return factor_sum(Sum(rself.function, (i, x2, y1)))
+                    
 
-    return Add(self, other)
+    # If no simplification could be done, try to add
+    # them as "offset sums". this function will return Add(self, other)
+    # if no simplification can be done
+    return add_offset_sum(self, other)
 
+
+# Contracts two sums if they are of the exact form
+# Sum(f(n), (n, S1+C1, S2+C2)) + Sum(g(n), (n, S1+C3, S2+C4))
+# Where C1 -> C4 are constant integers, and S1 and S2 are some symbols
+# or (entierly) absent. I.e, the symbol is either in both of the Sums upper/lower limits, or in neither
+def add_offset_sum(lexp, rexp):
+    from sympy.concrete import Sum
+    from sympy.core.numbers import Number
+    # Checks if an expression is of the form Symbol, Integer, Symbol ± Integer
+    # If it's not, returns none
+    # If it's Symbol±Integer, return a tuple of form (Symbol, ±Offset)
+    # If it's just a symbol, return (Symbol, 0)
+    # If it's just an integer, return (0, Integer)
+    def get_offset(exp):
+        if isinstance(exp, Symbol):
+            return (exp, 0)
+        if isinstance(exp, Integer):
+            return (0, exp.__int__())
+        if isinstance(exp, Add):
+            terms = exp.as_two_terms()
+            lhs = terms[0]
+            rhs = terms[1]
+            offset = lhs if isinstance(lhs, Integer) else rhs
+            symbol = lhs if isinstance(rhs, Integer) else rhs
+            if not isinstance(offset, Integer):
+                return None
+            if not isinstance(symbol, Symbol):
+                return None
+            return (symbol, offset.__int__())
+        return None
+
+    # Get the sign
+    # i.e 3*Sum() => 3, -Sum() => -1
+    # Return a tuplewith (Number, Sum)
+    # (exp, None) if invalid
+    def split_sign(exp):
+        if isinstance(exp, Sum):
+            return (exp, 1)
+        if isinstance(exp, Mul):
+            t1, t2 = exp.as_two_terms()
+            sum = t1 if isinstance(t1, Sum) else t2
+            sign = t2 if isinstance(t1, Sum) else t1
+            if not isinstance(sum, Sum):
+                return (exp, None)
+            if not isinstance(sign, Number):
+                return (exp, None)
+            return (sum, sign)
+            
+
+
+    lsum, lsign = split_sign(lexp)
+    rsum, rsign = split_sign(rexp)
+
+    if lsign == None or rsign == None:
+        return Add(lexp, rexp)
+
+    # Lower(a) and upper(b) limits for left(l) and right(r) sums
+    al = lsum.limits[0][1]
+    bl = lsum.limits[0][2]
+    ar = rsum.limits[0][1]
+    br = rsum.limits[0][2]
+
+    als = al.free_symbols
+    bls = bl.free_symbols
+    ars = ar.free_symbols
+    brs = br.free_symbols
+
+    if not (als == ars and bls == brs):
+        return Add(lexp, rexp)
+
+    a, CaL = get_offset(al)
+    _, CaR = get_offset(ar)
+    b, CbL = get_offset(bl)
+    _, CbR = get_offset(br)
+
+    Ca = max(CaL,CaR)
+    Cb = min(CbL,CbR)
+
+    # Find a dummy variable for the combined sum
+    lsum_n = lsum._args[1][0]
+    rsum_n = rsum._args[1][0]
+    rcom_n = None
+    
+    if lsum_n == rsum_n: # The dummy variables are already equal
+        rcom_n = lsum_n
+    elif not lsum_n in rsum.free_symbols: # Left one is not used in right exp, we use that one
+        rcom_n = lsum_n
+    elif not rsum_n in lsum.free_symbols: # Right one is not used in the left exp, we use that one
+        rcom_n = rsum_n
+    else:
+        # The dummy variable for the left sum is used as a variable in the right expression
+        # and visa versa. We will no loop over every possible combination of ascii_lower of *length*
+        # If we can not find a lable thats 'free', we increase *length* and try again until we do
+        length = 1
+        declared_symbols = lsum.free_symbols.union(rsum.free_symbols)
+        declared_names = [s.name for s in declared_symbols]
+        while rcom_n == None:
+            for labelTuple in list(itertools.combinations(string.ascii_lowercase, length)):
+                label = ''.join(labelTuple)
+                
+                if not label in declared_names:
+                    rcom_n = Symbol(label)
+                    break
+            length += 1
+
+    sums = Sum(
+        (lsign * lsum.function.subs({lsum_n: rcom_n})) + (rsign * rsum.function.subs({rsum_n: rcom_n})),
+        (rcom_n, a + Ca, b + Cb)
+    )
+
+    # rest sums
+    if (CaL < Ca):
+        sums += lsign * Sum(
+            lsum.function,
+            (lsum_n, a + CaL, a + Ca - 1)
+        )
+    if (CbL > Cb):
+        sums += lsign * Sum(
+            lsum.function,
+            (lsum_n, b + Cb + 1, b + CbL)
+        )
+    if (CaR < Ca):
+        sums += rsign * Sum(
+            rsum.function,
+            (rsum_n, a + CaR, a + Ca - 1)
+        )
+    if (CbR > Cb):
+        sums += rsign * Sum(
+            rsum.function,
+            (rsum_n, b + Cb + 1, b + CbR)
+        )
+
+    sums = simplify(sums)
+    return sums
 
 def product_simplify(s):
     """Main function for Product simplification"""
